@@ -677,6 +677,9 @@ def save(operator, context, filepath,
                     seq.flags |= Sequence.Blend
                 elif flag == "duration":
                     seq.duration = float(data)
+                elif flag == "fps":
+                    fps = float(data)
+                    seq.duration = frame_range / fps
                 else:
                     print("Warning: Unknown flag '{}' (used by sequence '{}')".format(flag, name))
 

@@ -119,7 +119,7 @@ Yes.
 
 #### How is the speed/duration of an animation determined?
 
-It should have the same length in-game and in Blender. It will evaluate and export the animation at the scene FPS (24 by default).
+It should have the same length in-game and in Blender. It will evaluate and export the animation at the scene FPS (24 by default). This can be overridden with either the `duration #` or `fps #` flags in the Sequences text block.
 
 #### How do I make an animation cyclic? How do I set the priority of an animations? How do I make an animation blend?
 
