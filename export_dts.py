@@ -15,6 +15,23 @@ import re
 re_lod_size = re.compile(r"(-?\d+)$")
 common_col_name = re.compile(r"^(LOS)?[cC]ol-?\d+$")
 
+def evaluated_mesh(bobj, depsgraph):
+    evaluated_object = bobj.evaluated_get(depsgraph)
+    mesh = evaluated_object.to_mesh(preserve_all_data_layers=True, depsgraph=depsgraph)
+    bm = bmesh.new()
+    bm.from_mesh(mesh)
+    bmesh.ops.triangulate(bm, faces=bm.faces)
+    bm.to_mesh(mesh)
+    bm.free()
+    return mesh, evaluated_object
+
+def collect_tverts(mesh, loop_order):
+    if not mesh.uv_layers:
+        return [Vector() for _ in loop_order]
+
+    uv_layer = mesh.uv_layers[0].data
+    return [Vector((uv_layer[i].uv.x, 1 - uv_layer[i].uv.y)) for i in loop_order]
+
 def undup_name(n):
     return n.split("#", 1)[0]
 
@@ -120,6 +137,9 @@ def export_material(mat, shape):
 
 def seq_float_eq(a, b):
     return all(abs(i - j) < 0.000001 for i, j in zip(a, b))
+
+def seq_vec_eq(a, b):
+    return len(a) == len(b) and all(seq_float_eq(i, j) for i, j in zip(a, b))
 
 def export_empty_node(lookup, shape, select_object, ob, parent=-1):
     if select_object and not ob.select_get():
@@ -345,7 +365,6 @@ def save_meshes(scene, shape, node_lookup, select_object):
             object = Object(shape.name(name), numMeshes=0, firstMesh=0, node=attach_node)
             object.has_transparency = False
             shape.objects.append(object)
-            shape.objectstates.append(ObjectState(1.0, 0, 0)) # ff56g: search for a37hm
             scene_objects[name] = (object, {})
 
         for slot in bobj.material_slots:
@@ -413,11 +432,11 @@ def save(operator, context, filepath,
          select_marker=False,
          blank_material=True,
          generate_texture="disabled",
-         apply_modifiers=True,
          debug_report=False):
     print("Exporting scene to DTS")
 
     scene = context.scene
+    depsgraph = context.evaluated_depsgraph_get()
     active = context.active_object
     shape = DtsShape()
 
@@ -442,6 +461,11 @@ def save(operator, context, filepath,
     # Note: If this plugin ever needs to do anything with objectstates,
     #       that needs to be handled properly. a37hm: earch for ff56g
     shape.objects.sort(key=lambda object: object.has_transparency) # TODO: attrgetter
+
+    for object in shape.objects:
+        node = shape.nodes[object.node]
+        vis = node.bl_ob.torque_vis_props.vis_value if hasattr(node, "bl_ob") and node.bl_ob is not None else 1.0
+        shape.objectstates.append(ObjectState(vis, 0, 0))
 
     # Sort detail levels
     shape.detail_levels.sort(key=attrgetter("size"), reverse=True)
@@ -490,20 +514,7 @@ def save(operator, context, filepath,
                     armature_modifier.show_render = False
                     armature_modifier.show_viewport = False
 
-                # gyt: apply modifiers
-                if apply_modifiers:
-                    old_active = bpy.context.view_layer.objects.active # remember the old active object so we don't annoy the living shit out of users
-                    bpy.context.view_layer.objects.active = bobj
-                    for modifier in bobj.modifiers:
-                        bpy.ops.object.modifier_apply(modifier=modifier.name)
-                    bpy.context.view_layer.objects.active = old_active
-
-                mesh = bobj.to_mesh()
-                bm = bmesh.new()
-                bm.from_mesh(mesh)
-                bmesh.ops.triangulate(bm, faces=bm.faces)
-                bm.to_mesh(mesh)
-                bm.free()
+                mesh, evaluated_object = evaluated_mesh(bobj, depsgraph)
 
                 # Restore the armature modifier
                 if armature_modifier is not None:
@@ -515,6 +526,8 @@ def save(operator, context, filepath,
 
                 dmesh = Mesh(mesh_type)
                 shape.meshes.append(dmesh)
+                dmesh.bl_object = bobj
+                dmesh.export_loop_order = []
 
                 dmesh.matrix_world = bobj.matrix_world
 
@@ -569,6 +582,7 @@ def save(operator, context, filepath,
                         for vert_index, loop_index in zip(reversed(poly.vertices), reversed(poly.loop_indices)):
                             vertex_index = len(dmesh.verts)
                             dmesh.indices.append(len(dmesh.indices))
+                            dmesh.export_loop_order.append(loop_index)
 
                             vert = mesh.vertices[vert_index]
 
@@ -600,9 +614,12 @@ def save(operator, context, filepath,
 
                 # ??? ? ?? ???? ??? ?
                 dmesh.vertsPerFrame = len(dmesh.verts)
+                dmesh.tvertsPerFrame = len(dmesh.tverts)
 
                 if len(dmesh.indices) >= 65536:
                     return fail(operator, "The mesh '{}' has too many vertex indices ({} >= 65536)".format(bobj.name, len(dmesh.indices)))
+
+                evaluated_object.to_mesh_clear()
 
                 ### Nobody leaves Hotel California
             else:
@@ -677,9 +694,9 @@ def save(operator, context, filepath,
         seq.scaleMatters = [False] * len(shape.nodes)
         seq.decalMatters = [False] * len(shape.nodes)
         seq.iflMatters = [False] * len(shape.nodes)
-        seq.visMatters = [False] * len(shape.nodes)
-        seq.frameMatters = [False] * len(shape.nodes)
-        seq.matFrameMatters = [False] * len(shape.nodes)
+        seq.visMatters = [False] * len(shape.objects)
+        seq.frameMatters = [False] * len(shape.objects)
+        seq.matFrameMatters = [False] * len(shape.objects)
 
         shape.sequences.append(seq)
 
@@ -687,6 +704,8 @@ def save(operator, context, filepath,
 
         # Store all animation data so we don't need to frame_set all over the place
         animation_data = {frame: {} for frame in frame_indices}
+        uv_animation_data = {frame: {} for frame in frame_indices}
+        animated_meshes = [mesh for mesh in shape.meshes if hasattr(mesh, "bl_object")]
 
         for frame in frame_indices:
             scene.frame_set(frame)
@@ -702,6 +721,11 @@ def save(operator, context, filepath,
 
                 animation_data[frame][node] = node.matrix.decompose() + (vis,)
 
+            for dmesh in animated_meshes:
+                mesh, evaluated_object = evaluated_mesh(dmesh.bl_object, depsgraph)
+                uv_animation_data[frame][dmesh] = collect_tverts(mesh, dmesh.export_loop_order)
+                evaluated_object.to_mesh_clear()
+
         for ob in shape.nodes:
             if hasattr(ob, "animation_data") == True and ob.armature is not None:
                 continue
@@ -711,13 +735,10 @@ def save(operator, context, filepath,
             node = shape.nodes[index]
 
             base_translation, base_rotation, _ = node.matrix.decompose()
-            base_scale = Vector((1.0, 1.0, 1.0))
 
             vis = 1.0
             if hasattr(node, "bl_ob") == True and node.bl_ob is not None:
                 vis = ob.bl_ob.get("torque_vis_props.vis_value", 1.0)
-
-            base_object_state = ObjectState(vis, 0, 0)
 
             if hasattr(ob, "animation_data") == True and ob.animation_data is not None and ob.animation_data.action is not None:
                 fcurves = ob.animation_data.action.fcurves
@@ -725,7 +746,6 @@ def save(operator, context, filepath,
                 curves_rotation = array_from_fcurves_rotation(fcurves, ob)
                 curves_translation = array_from_fcurves(fcurves, "location", 3)
                 curves_scale = array_from_fcurves(fcurves, "scale", 3)
-                curves_vis = array_from_fcurves(fcurves, "torque_vis_props.vis_value", 1)
 
                 # Decide what matters by presence of f-curves
                 if curves_rotation and fcurves_keyframe_in_range(curves_rotation, frame_start, frame_end):
@@ -736,9 +756,6 @@ def save(operator, context, filepath,
 
                 if curves_scale and fcurves_keyframe_in_range(curves_scale, frame_start, frame_end):
                     seq.scaleMatters[index] = True
-
-                if curves_vis and fcurves_keyframe_in_range(curves_vis, frame_start, frame_end):
-                    seq.visMatters[index] = True
 
                 # Write the data where it matters
                 for frame in frame_indices:
@@ -757,8 +774,33 @@ def save(operator, context, filepath,
                     if seq.scaleMatters[index]:
                         shape.node_aligned_scales.append(scale)
 
-                    if seq.visMatters[index]:
-                        shape.objectstates.append(ObjectState(vis, frame, 0))
+        for index, obj in enumerate(shape.objects):
+            node = shape.nodes[obj.node]
+            vis_matters = False
+
+            if hasattr(node, "animation_data") and node.animation_data is not None and node.animation_data.action is not None:
+                curves_vis = array_from_fcurves(node.animation_data.action.fcurves, "torque_vis_props.vis_value", 1)
+                vis_matters = curves_vis and fcurves_keyframe_in_range(curves_vis, frame_start, frame_end)
+
+            object_meshes = [mesh for mesh in shape.meshes[obj.firstMesh:obj.firstMesh + obj.numMeshes] if hasattr(mesh, "bl_object")]
+            mat_frame_matters = any(not seq_vec_eq(dmesh.tverts[:dmesh.tvertsPerFrame], uv_animation_data[frame][dmesh]) for dmesh in object_meshes for frame in frame_indices)
+            base_mat_frame = object_meshes[0].numMatFrames if mat_frame_matters else 0
+
+            if mat_frame_matters:
+                seq.matFrameMatters[index] = True
+
+                for dmesh in object_meshes:
+                    for frame in frame_indices:
+                        dmesh.tverts.extend(uv_animation_data[frame][dmesh])
+                    dmesh.numMatFrames += frame_range
+
+            if vis_matters:
+                seq.visMatters[index] = True
+
+            if vis_matters or mat_frame_matters:
+                for frame_index, frame in enumerate(frame_indices):
+                    mat_frame = base_mat_frame + frame_index if mat_frame_matters else 0
+                    shape.objectstates.append(ObjectState(animation_data[frame][node][3], frame_index, mat_frame))
 
     if debug_report:
         print("Writing debug report")

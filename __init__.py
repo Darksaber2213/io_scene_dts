@@ -164,12 +164,6 @@ class ExportDTS(bpy.types.Operator, ExportHelper):
             ("all-always", "All (always)", "Generate textures for all materials"))
         )
 
-    apply_modifiers: BoolProperty(
-        name="Apply modifiers",
-        description="Apply modifiers to meshes",
-        default=True,
-        )
-
     debug_report: BoolProperty(
         name="Write debug report",
         description="Dump out all the information from the DTS to a file",
